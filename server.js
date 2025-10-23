@@ -5,6 +5,7 @@ import fs from "fs";
 import os from "os";
 import cors from "cors";
 import { spawn } from "child_process";
+import { v4 as uuid } from "uuid";
 import "dotenv/config";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -14,15 +15,19 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// CORS setup
+// ✅ CORS setup
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 app.use(cors({ origin: FRONTEND_URL }));
 
-// Temp folder
+// ✅ Temp folder
 const TMP_DIR = path.join(os.tmpdir(), "maps-scraper");
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
-// Route: trigger scrape
+// ✅ In-memory stores (use Redis/db for production)
+const jobs = {};
+const scrapers = {};
+
+// 🚀 Start scraping job
 app.post("/scrape", (req, res) => {
   const { query } = req.body;
   if (!query) return res.status(400).json({ error: "Missing query or URL" });
@@ -31,27 +36,17 @@ app.post("/scrape", (req, res) => {
     ? query
     : `https://www.google.com/maps/search/${encodeURIComponent(query)}/`;
 
-  console.log(`🚀 Starting scrape for: ${url}`);
+  const jobId = uuid();
+  jobs[jobId] = { status: "running" };
+
+  console.log(`🚀 Starting scrape for: ${url} (jobId: ${jobId})`);
 
   const scraper = spawn("node", [path.join(__dirname, "scrape-maps.js"), url], {
     stdio: ["ignore", "pipe", "pipe"],
   });
+  scrapers[jobId] = scraper;
 
   let errorOutput = "";
-  let isCancelled = false;
-
-  scraper.on("exit", (code, signal) => {
-    console.log(`Scraper exited with code ${code}, signal ${signal}`);
-  });
-
-  // if user cancels or refreshes, kill the scraper
-  req.on("close", () => {
-    if (!isCancelled) {
-      isCancelled = true;
-      console.log("Client disconnected or cancelled → Killing scraper...");
-      scraper.kill("SIGTERM"); // Send terminate signal
-    }
-  });
 
   scraper.stdout.on("data", (data) => console.log(data.toString()));
   scraper.stderr.on("data", (data) => {
@@ -59,14 +54,8 @@ app.post("/scrape", (req, res) => {
     console.error(data.toString());
   });
 
-  scraper.on("close", (code, signal) => {
-    if (isCancelled) {
-      console.log("Scrape cancelled by client.");
-      return res.status(499).json({
-        success: false,
-        message: "Scrape cancelled by user.",
-      });
-    }
+  scraper.on("close", () => {
+    delete scrapers[jobId]; // cleanup process reference
 
     const latest = fs
       .readdirSync(TMP_DIR)
@@ -78,39 +67,67 @@ app.post("/scrape", (req, res) => {
       )[0];
 
     if (latest) {
-      console.log(`Scrape completed → ${latest}`);
-      return res.json({
-        success: true,
-        message: "Scraping completed",
-        file: latest,
-        downloadUrl: `/download/${encodeURIComponent(latest)}`,
-      });
+      jobs[jobId] = { status: "completed", file: latest };
+      console.log(`✅ Scrape completed → ${latest} (jobId: ${jobId})`);
+    } else {
+      jobs[jobId] = { status: "failed", error: errorOutput || "No CSV file generated" };
+      console.error(`❌ Scraping failed (jobId: ${jobId}):`, errorOutput);
     }
-
-    console.error("No file generated:", errorOutput);
-    res.status(500).json({
-      success: false,
-      message: "Scraping failed",
-      error: errorOutput || "No CSV file generated",
-    });
   });
+
+  res.json({ jobId });
 });
 
-// Route: download CSV file
-app.get("/download/:file", (req, res) => {
-  const filePath = path.join(TMP_DIR, req.params.file);
-  if (!fs.existsSync(filePath)) {
-    console.error("File not found:", filePath);
-    return res.status(404).send("File not found");
+// 🧠 Check job status
+app.get("/status/:jobId", (req, res) => {
+  const job = jobs[req.params.jobId];
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  res.json(job);
+});
+
+// 🛑 Cancel a job
+app.post("/cancel/:jobId", (req, res) => {
+  const jobId = req.params.jobId;
+  const scraper = scrapers[jobId];
+
+  if (scraper) {
+    scraper.kill("SIGTERM");
+    delete scrapers[jobId];
+    jobs[jobId] = { status: "cancelled" };
+    console.log(`🛑 Cancelled job ${jobId}`);
+    return res.json({ success: true, message: "Job cancelled" });
   }
+
+  res.status(404).json({ success: false, message: "No active scraper found" });
+});
+
+// 📥 Download CSV
+app.get("/download/:jobId", (req, res) => {
+  const job = jobs[req.params.jobId];
+  if (!job || !job.file) return res.status(404).send("File not ready");
+
+  const filePath = path.join(TMP_DIR, job.file);
+  if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
+
   res.download(filePath, (err) => {
-    if (!err) fs.unlinkSync(filePath);
+    if (!err) fs.unlinkSync(filePath); // cleanup after download
   });
 });
 
-// Start server
+// 🧹 Periodic cleanup (optional)
+setInterval(() => {
+  const files = fs.readdirSync(TMP_DIR);
+  const now = Date.now();
+  for (const f of files) {
+    const filePath = path.join(TMP_DIR, f);
+    const age = now - fs.statSync(filePath).mtimeMs;
+    if (age > 1000 * 60 * 30) fs.unlinkSync(filePath); // older than 30 mins
+  }
+}, 1000 * 60 * 10);
+
+// ✅ Start server
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  console.log(`Backend server running on port ${PORT}`);
-  console.log(`Frontend URL: ${FRONTEND_URL}`);
+  console.log(`✅ Backend running on port ${PORT}`);
+  console.log(`🌐 Frontend URL: ${FRONTEND_URL}`);
 });
