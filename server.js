@@ -37,9 +37,12 @@ app.post("/scrape", (req, res) => {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  let output = "";
   let errorOutput = "";
   let isCancelled = false;
+
+  scraper.on("exit", (code, signal) => {
+    console.log(`Scraper exited with code ${code}, signal ${signal}`);
+  });
 
   // if user cancels or refreshes, kill the scraper
   req.on("close", () => {
@@ -92,7 +95,6 @@ app.post("/scrape", (req, res) => {
     });
   });
 });
-
 
 // Route: download CSV file
 app.get("/download/:file", (req, res) => {
