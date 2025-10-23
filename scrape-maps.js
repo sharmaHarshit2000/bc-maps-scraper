@@ -59,6 +59,19 @@ async function scrapeGoogleMaps(searchUrl) {
   if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
   let browser;
+  // Handle kill signals
+  let isCancelled = false;
+
+  process.on("SIGTERM", async () => {
+    isCancelled = true;
+    console.log("Received stop signal — closing browser...");
+    try {
+      if (browser) await browser.close();
+    } catch (err) {
+      console.error("Error closing browser:", err.message);
+    }
+    process.exit(0);
+  });
 
   try {
     if (isRender) {
@@ -122,6 +135,10 @@ async function scrapeGoogleMaps(searchUrl) {
   let skipped = 0;
 
   for (let i = 0; i < prevCount; i++) {
+    if (isCancelled) {
+      console.log("Scraping cancelled — exiting loop.");
+      break;
+    }
     console.log(`Scraping place ${i + 1} of ${prevCount}...`);
     const places = await page.$$(".Nv2PK");
     if (!places[i]) continue;

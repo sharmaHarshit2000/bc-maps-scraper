@@ -31,7 +31,7 @@ app.post("/scrape", (req, res) => {
     ? query
     : `https://www.google.com/maps/search/${encodeURIComponent(query)}/`;
 
-  console.log(`Starting scrape for: ${url}`);
+  console.log(`🚀 Starting scrape for: ${url}`);
 
   const scraper = spawn("node", [path.join(__dirname, "scrape-maps.js"), url], {
     stdio: ["ignore", "pipe", "pipe"],
@@ -39,18 +39,32 @@ app.post("/scrape", (req, res) => {
 
   let output = "";
   let errorOutput = "";
+  let isCancelled = false;
 
-  scraper.stdout.on("data", (data) => {
-    output += data.toString();
-    console.log(data.toString());
+  // if user cancels or refreshes, kill the scraper
+  req.on("close", () => {
+    if (!isCancelled) {
+      isCancelled = true;
+      console.log("Client disconnected or cancelled → Killing scraper...");
+      scraper.kill("SIGTERM"); // Send terminate signal
+    }
   });
 
+  scraper.stdout.on("data", (data) => console.log(data.toString()));
   scraper.stderr.on("data", (data) => {
     errorOutput += data.toString();
     console.error(data.toString());
   });
 
-  scraper.on("close", () => {
+  scraper.on("close", (code, signal) => {
+    if (isCancelled) {
+      console.log("Scrape cancelled by client.");
+      return res.status(499).json({
+        success: false,
+        message: "Scrape cancelled by user.",
+      });
+    }
+
     const latest = fs
       .readdirSync(TMP_DIR)
       .filter((f) => f.endsWith(".csv"))
@@ -61,6 +75,7 @@ app.post("/scrape", (req, res) => {
       )[0];
 
     if (latest) {
+      console.log(`Scrape completed → ${latest}`);
       return res.json({
         success: true,
         message: "Scraping completed",
@@ -69,6 +84,7 @@ app.post("/scrape", (req, res) => {
       });
     }
 
+    console.error("No file generated:", errorOutput);
     res.status(500).json({
       success: false,
       message: "Scraping failed",
@@ -76,6 +92,7 @@ app.post("/scrape", (req, res) => {
     });
   });
 });
+
 
 // Route: download CSV file
 app.get("/download/:file", (req, res) => {
@@ -92,6 +109,6 @@ app.get("/download/:file", (req, res) => {
 // Start server
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  console.log(`✅ Backend server running on port ${PORT}`);
+  console.log(`Backend server running on port ${PORT}`);
   console.log(`Frontend URL: ${FRONTEND_URL}`);
 });
